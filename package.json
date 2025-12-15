@@ -1,0 +1,21 @@
+{
+  "name": "text2cal",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "esbuild src/index.ts --platform=neutral --target=es2020 --format=cjs --outfile=dist/index.js",
+    "push": "npm run build && clasp push",
+    "logs": "clasp logs --watch"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@google/clasp": "^3.1.3",
+    "@types/google-apps-script": "^2.0.8",
+    "esbuild": "^0.27.1",
+    "typescript": "^5.9.3"
+  }
+}
