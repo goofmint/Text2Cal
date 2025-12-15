@@ -117,18 +117,31 @@ function resolveOrAssignColorIdByLabel_(label) {
   if (!label) return void 0;
   const normalized = normalizeLabel_(label);
   if (!normalized) return void 0;
-  const rows = loadColorsRows_();
-  const found = rows.find((r) => normalizeLabel_(r.label) === normalized);
+  const initialRows = loadColorsRows_();
+  const found = initialRows.find((r) => normalizeLabel_(r.label) === normalized);
   if (found) return found.colorId;
-  const empty = rows.find((r) => !r.label);
-  if (!empty) throw new Error(`No empty label slots left in colors sheet for label: ${normalized}`);
-  const sheet = colorsSheet_();
-  const header = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map((v) => String(v).trim());
-  const labelColIdx = header.indexOf("label");
-  if (labelColIdx < 0) throw new Error("colors header missing 'label' column.");
-  sheet.getRange(empty.rowIndex, labelColIdx + 1).setValue(normalized);
-  invalidateCache();
-  return empty.colorId;
+  const lock = LockService.getScriptLock();
+  const lockTimeout = 3e4;
+  try {
+    if (!lock.tryLock(lockTimeout)) {
+      throw new Error(`Failed to acquire lock for label assignment within ${lockTimeout}ms. Please retry.`);
+    }
+    invalidateCache();
+    const rows = loadColorsRows_();
+    const existingLabel = rows.find((r) => normalizeLabel_(r.label) === normalized);
+    if (existingLabel) return existingLabel.colorId;
+    const empty = rows.find((r) => !r.label);
+    if (!empty) throw new Error(`No empty label slots left in colors sheet for label: ${normalized}`);
+    const sheet = colorsSheet_();
+    const header = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map((v) => String(v).trim());
+    const labelColIdx = header.indexOf("label");
+    if (labelColIdx < 0) throw new Error("colors header missing 'label' column.");
+    sheet.getRange(empty.rowIndex, labelColIdx + 1).setValue(normalized);
+    invalidateCache();
+    return empty.colorId;
+  } finally {
+    lock.releaseLock();
+  }
 }
 function createCalendarEvent_(calendarId, ev, colorId) {
   const resource = {
@@ -143,7 +156,7 @@ function createCalendarEvent_(calendarId, ev, colorId) {
 }
 function parseWithGemini_(text, nowIso, timeZone) {
   const apiKey = getProp_("GEMINI_API_KEY");
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
   const prompt = buildPrompt_(text, nowIso, timeZone);
   const payload = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
@@ -152,6 +165,9 @@ function parseWithGemini_(text, nowIso, timeZone) {
   const res = UrlFetchApp.fetch(url, {
     method: "post",
     contentType: "application/json",
+    headers: {
+      "x-goog-api-key": apiKey
+    },
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
   });
@@ -189,60 +205,67 @@ function validateParsed_(obj, timeZone) {
   if (!/[+-]\d{2}:\d{2}$/.test(obj.end)) throw new Error("end must end with timezone offset like +09:00");
 }
 function buildPrompt_(text, nowIso, timeZone) {
-  return `You are a multilingual parser that converts free-form schedule text into ONE Google Calendar event object.
-The input may be Japanese, English, or other languages.
+  return `
+You are a scheduling assistant that converts free-form natural language
+event descriptions into structured Google Calendar event data.
 
-Return ONLY a JSON object with EXACT fields:
-title, location, label, timezone, start, end, recurrence
+The input may be written in any language. Japanese and English must be supported.
 
-Constraints:
-- timezone must be exactly: "${timeZone}" (IANA timezone string)
-- start/end must be ISO 8601 with timezone OFFSET, e.g. "2025-12-15T15:00:00+09:00"
+Your task is to extract the following fields:
 
-Extraction markers (language-agnostic):
-- "#<label>" assigns label. Take text after "#" until whitespace/end. If missing, label=null.
-- "@<place>" or "\uFF20<place>" assigns location. Take text after @ until end (trim). If missing, location=null.
-- Duration may be specified in brackets:
-  - Japanese: [30\u5206], [90\u5206], [1\u6642\u9593]
-  - English: [30m], [30min], [30 minutes], [1h], [1 hour]
-  - If duration missing, default duration = 60 minutes.
+- title: string
+- start: ISO 8601 datetime string
+- end: ISO 8601 datetime string
+- location: string | null
+- label: string | null
+- recurrence: RRULE string | null
 
-Title rules:
-- Remove date/time tokens, recurrence tokens, duration brackets, #label, @location from the title.
-- The remaining text is title. If empty, title="Event".
+Rules:
 
-Date/time interpretation (IMPORTANT):
-- Interpret dates/times in timezone "${timeZone}".
-- Use CURRENT_TIME_ISO as the reference "now".
-- Relative day examples:
-  - Japanese: \u4ECA\u65E5, \u660E\u65E5, \u660E\u5F8C\u65E5
-  - English: today, tomorrow, the day after tomorrow
-- Weekdays examples:
-  - Japanese: \u6708 \u706B \u6C34 \u6728 \u91D1 \u571F \u65E5 (optionally with \u66DC\u65E5)
-  - English: Monday Tuesday Wednesday Thursday Friday Saturday Sunday
-- If weekday is specified without a date, choose the NEXT occurrence after now;
-  if today matches and the time is still in the future, you may use today.
-- If time is missing, assume 09:00.
+1. Date and time:
+  - Interpret relative expressions like "tomorrow", "next Monday", "\u660E\u65E5", "\u6765\u9031".
+  - If duration is specified (e.g. "45\u5206", "45 minutes"), calculate end time.
+  - If no duration is specified, default to 60 minutes.
 
-Time examples:
-- Japanese: 15\u6642 => 15:00, 15:30 => 15:30, \u5348\u5F8C3\u6642 => 15:00
-- English: 3pm => 15:00, 15:00 => 15:00, 3:30 PM => 15:30
+2. Label:
+  - A word prefixed with "#" is always a label.
+  - Remove the label text from the title.
 
-Recurrence normalization:
-- Weekly examples: "\u6BCE\u9031\u706B\u66DC\u65E5", "every Tuesday", "weekly on Tuesday"
-  => recurrence={"rrule":"FREQ=WEEKLY;BYDAY=TU"}
-- Biweekly examples: "\u9694\u9031\u65E5\u66DC\u65E5", "every other Sunday", "biweekly on Sunday"
-  => recurrence={"rrule":"FREQ=WEEKLY;INTERVAL=2;BYDAY=SU"}
-- Otherwise recurrence=null.
-- BYDAY mapping for Japanese weekdays: \u6708=MO \u706B=TU \u6C34=WE \u6728=TH \u91D1=FR \u571F=SA \u65E5=SU
+3. Location:
+  - If a word or phrase is prefixed with "@", it is always the location.
+  - Otherwise, if a place name appears with particles or prepositions
+    such as:
+      - Japanese: "\u3067", "\u306B\u3066", "\u5834\u6240\u306F"
+      - English: "at", "in", "from"
+    then treat that place name as the location.
+  - Typical place examples include cities, venues, offices, online platforms.
+  - Remove the location text from the title.
 
-If date/time cannot be confidently parsed:
-- Choose the earliest reasonable upcoming time: today 09:00 if still future else tomorrow 09:00 (in "${timeZone}").
+4. Title:
+  - The title should be what remains after removing date/time,
+    duration, label, and location.
+  - The title must be concise and human-readable.
 
-INPUT: ${text}
-CURRENT_TIME_ISO: ${nowIso}
+5. Output:
+  - Return only valid JSON.
+  - Do not include explanations or comments.
+  - Use null if a field is not present.
 
-Return only the JSON object.`;
+Example:
+
+Input:
+"\u660E\u65E514\u6642\u306B\u6771\u4EAC\u306745\u5206\u306E\u767B\u58C7 #CodeRabbit"
+
+Output:
+{
+  "title": "\u767B\u58C7",
+  "start": "YYYY-MM-DDT14:00:00",
+  "end": "YYYY-MM-DDT14:45:00",
+  "location": "\u6771\u4EAC",
+  "label": "CodeRabbit",
+  "recurrence": null
+}
+`;
 }
 function test_doPost_dryRun_en() {
   const body = {
