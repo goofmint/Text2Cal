@@ -2,10 +2,13 @@
 
 /**
  * Container-bound Apps Script (Spreadsheet-bound)
- * Sheet: "colors" ONLY
+ * Sheets: "colors", "logs"
  *
  * colors schema (header row required):
  *   colorId | label | background | foreground
+ *
+ * logs schema (auto-created):
+ *   timestamp | requestText | parseResult | calendarResult | status | errorMessage
  *
  * Label->color rules:
  * - If "#label" is provided:
@@ -40,6 +43,14 @@ type ParsedEvent = {
   recurrence: Recurrence;
 };
 
+type ParsedTask = {
+  title: string;
+  due: string | null;      // ISO8601 date (YYYY-MM-DD)
+  notes: string | null;    // Additional notes (including recurrence info)
+  recurrence: string | null; // Human-readable recurrence description
+  taskList: string | null;  // Task list name (extracted from #label)
+};
+
 type RequestBody = {
   text: string;
   nowIso?: string;
@@ -48,8 +59,9 @@ type RequestBody = {
 };
 
 const COLORS_SHEET_NAME = "colors";
+const LOGS_SHEET_NAME = "logs";
 const DEFAULT_CALENDAR_ID = "primary";
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-2.5-flash-lite";
 
 // Cache (colors rows only)
 const CACHE_TTL_SECONDS = 60 * 5;
@@ -57,26 +69,121 @@ const CACHE_COLORS_KEY = "CACHE_COLORS_ROWS_V3";
 
 // ===== Entry point =====
 function doPost(e: GoogleAppsScript.Events.DoPost): GoogleAppsScript.Content.TextOutput {
+  let logRowIndex: number | null = null;
+
   try {
     const body = parseRequest_(e);
+    const timestamp = new Date();
+
+    // Create initial log entry
+    logRowIndex = createLogEntry_(body.text, timestamp);
 
     const expected = getProp_("SHARED_SECRET");
     if (body.secret !== expected) {
+      if (logRowIndex) {
+        updateLogEntry_(logRowIndex, {
+          status: "UNAUTHORIZED",
+          errorMessage: "Authentication failed"
+        });
+      }
       return jsonResponse_({ ok: false, error: "Unauthorized" }, 401);
     }
 
     const timeZone = getUserTimeZone_();
     const nowIso = body.nowIso || new Date().toISOString();
 
+    // Check if this is a task (starts with "!")
+    const isTask = body.text.trim().startsWith("!");
+
+    if (isTask) {
+      // Task processing
+      const parsedTask = parseTaskWithGemini_(body.text, nowIso, timeZone);
+
+      // Update log with parse result
+      if (logRowIndex) {
+        updateLogEntry_(logRowIndex, {
+          parseResult: JSON.stringify(parsedTask, null, 2),
+          status: "PARSED"
+        });
+      }
+
+      if (body.dryRun) {
+        if (logRowIndex) {
+          updateLogEntry_(logRowIndex, {
+            status: "DRY_RUN",
+            calendarResult: JSON.stringify({
+              task: parsedTask,
+              taskList: parsedTask.taskList || "@default",
+              dryRun: true
+            }, null, 2)
+          });
+        }
+        return jsonResponse_({
+          ok: true,
+          timeZone,
+          parsed: parsedTask,
+          type: "task",
+          taskList: parsedTask.taskList || "@default"
+        });
+      }
+
+      const createdTask = createGoogleTask_(parsedTask);
+
+      // Update log with task creation result
+      if (logRowIndex) {
+        updateLogEntry_(logRowIndex, {
+          calendarResult: JSON.stringify({
+            id: createdTask.id,
+            status: createdTask.status,
+            title: createdTask.title,
+            due: createdTask.due,
+            taskList: parsedTask.taskList || "@default"
+          }, null, 2),
+          status: "SUCCESS"
+        });
+      }
+
+      return jsonResponse_({
+        ok: true,
+        timeZone,
+        parsed: parsedTask,
+        type: "task",
+        created: {
+          id: createdTask.id,
+          status: createdTask.status,
+          title: createdTask.title,
+          due: createdTask.due,
+          selfLink: createdTask.selfLink,
+          taskList: parsedTask.taskList || "@default"
+        }
+      });
+    }
+
+    // Calendar event processing
     const parsed = parseWithGemini_(body.text, nowIso, timeZone);
+
+    // Update log with parse result
+    if (logRowIndex) {
+      updateLogEntry_(logRowIndex, {
+        parseResult: JSON.stringify(parsed, null, 2),
+        status: "PARSED"
+      });
+    }
 
     const colorId = resolveOrAssignColorIdByLabel_(parsed.label);
 
     if (body.dryRun) {
+      if (logRowIndex) {
+        updateLogEntry_(logRowIndex, {
+          status: "DRY_RUN",
+          calendarResult: JSON.stringify({ colorId, dryRun: true }, null, 2)
+        });
+      }
       return jsonResponse_({
         ok: true,
         timeZone,
         parsed,
+        type: "event",
         resolved: { colorId }
       });
     }
@@ -84,10 +191,24 @@ function doPost(e: GoogleAppsScript.Events.DoPost): GoogleAppsScript.Content.Tex
     const calendarId = getPropOptional_("CALENDAR_ID") || DEFAULT_CALENDAR_ID;
     const created = createCalendarEvent_(calendarId, parsed, colorId);
 
+    // Update log with calendar creation result
+    if (logRowIndex) {
+      updateLogEntry_(logRowIndex, {
+        calendarResult: JSON.stringify({
+          id: created.id,
+          status: created.status,
+          htmlLink: created.htmlLink,
+          colorId
+        }, null, 2),
+        status: "SUCCESS"
+      });
+    }
+
     return jsonResponse_({
       ok: true,
       timeZone,
       parsed,
+      type: "event",
       resolved: { colorId },
       created: {
         id: created.id,
@@ -96,6 +217,13 @@ function doPost(e: GoogleAppsScript.Events.DoPost): GoogleAppsScript.Content.Tex
       }
     });
   } catch (err: any) {
+    // Update log with error
+    if (logRowIndex) {
+      updateLogEntry_(logRowIndex, {
+        status: "ERROR",
+        errorMessage: String(err?.message ?? err)
+      });
+    }
     return jsonResponse_({ ok: false, error: String(err?.message ?? err) }, 500);
   }
 }
@@ -148,6 +276,62 @@ function colorsSheet_(): GoogleAppsScript.Spreadsheet.Sheet {
   const sheet = ss.getSheetByName(COLORS_SHEET_NAME);
   if (!sheet) throw new Error(`Sheet not found: ${COLORS_SHEET_NAME}`);
   return sheet;
+}
+
+// ===== Logs sheet (auto-create if not exists) =====
+function logsSheet_(): GoogleAppsScript.Spreadsheet.Sheet {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(LOGS_SHEET_NAME);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(LOGS_SHEET_NAME);
+    // Set header row
+    const headers = ["timestamp", "requestText", "parseResult", "calendarResult", "status", "errorMessage"];
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+  }
+
+  return sheet;
+}
+
+function createLogEntry_(text: string, timestamp: Date): number {
+  const sheet = logsSheet_();
+  const nextRow = sheet.getLastRow() + 1;
+
+  sheet.getRange(nextRow, 1, 1, 6).setValues([[
+    timestamp,
+    text,
+    "", // parseResult - will be updated later
+    "", // calendarResult - will be updated later
+    "RECEIVED", // status
+    "" // errorMessage
+  ]]);
+
+  return nextRow;
+}
+
+type LogUpdate = {
+  parseResult?: string;
+  calendarResult?: string;
+  status?: string;
+  errorMessage?: string;
+};
+
+function updateLogEntry_(rowIndex: number, updates: LogUpdate): void {
+  const sheet = logsSheet_();
+
+  if (updates.parseResult !== undefined) {
+    sheet.getRange(rowIndex, 3).setValue(updates.parseResult);
+  }
+  if (updates.calendarResult !== undefined) {
+    sheet.getRange(rowIndex, 4).setValue(updates.calendarResult);
+  }
+  if (updates.status !== undefined) {
+    sheet.getRange(rowIndex, 5).setValue(updates.status);
+  }
+  if (updates.errorMessage !== undefined) {
+    sheet.getRange(rowIndex, 6).setValue(updates.errorMessage);
+  }
 }
 
 function invalidateCache(): void {
@@ -263,28 +447,70 @@ function createCalendarEvent_(
     recurrence: ev.recurrence ? [`RRULE:${ev.recurrence.rrule}`] : undefined,
     colorId: colorId
   };
-  return Calendar.Events.insert(resource, calendarId);
+  return Calendar!.Events.insert(resource, calendarId);
+}
+
+// ===== Google Tasks (Advanced Tasks service) =====
+function getOrCreateTaskList_(listName: string): string {
+  // Get all task lists
+  const taskLists = Tasks!.Tasklists.list();
+
+  if (!taskLists.items) {
+    // No task lists exist, create the first one
+    const newList = Tasks!.Tasklists.insert({ title: listName });
+    return newList.id!;
+  }
+
+  // Search for existing list by name
+  const existing = taskLists.items.find(list => list.title === listName);
+  if (existing) {
+    return existing.id!;
+  }
+
+  // List not found, create new one
+  const newList = Tasks!.Tasklists.insert({ title: listName });
+  return newList.id!;
+}
+
+function createGoogleTask_(task: ParsedTask): GoogleAppsScript.Tasks.Schema.Task {
+  const resource: GoogleAppsScript.Tasks.Schema.Task = {
+    title: task.title,
+    due: task.due ? `${task.due}T00:00:00.000Z` : undefined,
+    notes: task.notes ?? undefined
+  };
+
+  // Determine task list ID
+  let tasklistId: string;
+  if (task.taskList) {
+    tasklistId = getOrCreateTaskList_(task.taskList);
+  } else {
+    tasklistId = "@default";
+  }
+
+  return Tasks!.Tasks.insert(resource, tasklistId);
 }
 
 // ===== Gemini parsing =====
 function parseWithGemini_(text: string, nowIso: string, timeZone: string): ParsedEvent {
   const apiKey = getProp_("GEMINI_API_KEY");
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
 
-  const prompt = buildPrompt_(text, nowIso, timeZone);
+  const systemPrompt = buildSystemPrompt_(timeZone);
+  const userPrompt = buildUserPrompt_(text, nowIso);
 
   const payload = {
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { temperature: 0.0 }
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      temperature: 0.0
+    }
   };
 
   const res = UrlFetchApp.fetch(url, {
     method: "post",
     contentType: "application/json",
-    headers: {
-      "x-goog-api-key": apiKey
-    },
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
   });
@@ -294,25 +520,13 @@ function parseWithGemini_(text: string, nowIso: string, timeZone: string): Parse
   if (code < 200 || code >= 300) throw new Error(`Gemini API error: HTTP ${code} ${raw}`);
 
   const data = JSON.parse(raw);
-  const outText: string | undefined =
-    data?.candidates?.[0]?.content?.parts?.map((p: any) => p.text).filter(Boolean).join("") ||
-    data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  const outText: string | undefined = data?.candidates?.[0]?.content?.parts?.[0]?.text;
 
   if (!outText) throw new Error("Gemini returned empty output.");
 
-  const parsed = safeJsonParse_(outText);
+  const parsed = JSON.parse(outText);
   validateParsed_(parsed, timeZone);
   return parsed as ParsedEvent;
-}
-
-function safeJsonParse_(text: string): any {
-  try {
-    return JSON.parse(text);
-  } catch {
-    const m = text.match(/\{[\s\S]*\}/);
-    if (!m) throw new Error(`Gemini output is not JSON: ${text}`);
-    return JSON.parse(m[0]);
-  }
 }
 
 function validateParsed_(obj: any, timeZone: string): void {
@@ -332,68 +546,168 @@ function validateParsed_(obj: any, timeZone: string): void {
   if (!/[+-]\d{2}:\d{2}$/.test(obj.end)) throw new Error("end must end with timezone offset like +09:00");
 }
 
-function buildPrompt_(text: string, nowIso: string, timeZone: string): string {
-  return `
-You are a scheduling assistant that converts free-form natural language
-event descriptions into structured Google Calendar event data.
+function parseTaskWithGemini_(text: string, nowIso: string, timeZone: string): ParsedTask {
+  const apiKey = getProp_("GEMINI_API_KEY");
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+
+  const systemPrompt = buildTaskSystemPrompt_(timeZone);
+  const userPrompt = buildTaskUserPrompt_(text, nowIso);
+
+  const payload = {
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      temperature: 0.0
+    }
+  };
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const code = res.getResponseCode();
+  const raw = res.getContentText();
+  if (code < 200 || code >= 300) throw new Error(`Gemini API error: HTTP ${code} ${raw}`);
+
+  const data = JSON.parse(raw);
+  const outText: string | undefined = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+  if (!outText) throw new Error("Gemini returned empty output.");
+
+  const parsed = JSON.parse(outText);
+  validateParsedTask_(parsed);
+  return parsed as ParsedTask;
+}
+
+function validateParsedTask_(obj: any): void {
+  const required = ["title", "due", "notes", "recurrence", "taskList"];
+  for (const k of required) if (!(k in obj)) throw new Error(`Missing field: ${k}`);
+
+  if (typeof obj.title !== "string" || !obj.title.trim()) throw new Error("title must be non-empty string");
+  if (!(obj.due === null || typeof obj.due === "string")) throw new Error("due must be string|null");
+  if (!(obj.notes === null || typeof obj.notes === "string")) throw new Error("notes must be string|null");
+  if (!(obj.recurrence === null || typeof obj.recurrence === "string")) throw new Error("recurrence must be string|null");
+  if (!(obj.taskList === null || typeof obj.taskList === "string")) throw new Error("taskList must be string|null");
+
+  if (obj.due && !/^\d{4}-\d{2}-\d{2}$/.test(obj.due)) {
+    throw new Error("due must be in YYYY-MM-DD format");
+  }
+}
+
+function buildSystemPrompt_(timeZone: string): string {
+  return `You are a scheduling assistant that converts free-form natural language event descriptions into structured Google Calendar event data.
 
 The input may be written in any language. Japanese and English must be supported.
 
-Your task is to extract the following fields:
+Your task is to extract the following fields and return them as a JSON object:
 
-- title: string
-- start: ISO 8601 datetime string
-- end: ISO 8601 datetime string
-- location: string | null
-- label: string | null
-- recurrence: RRULE string | null
+- title: string (the event title)
+- start: string (ISO 8601 datetime with timezone offset, e.g., "2025-12-16T14:00:00+09:00")
+- end: string (ISO 8601 datetime with timezone offset)
+- location: string | null (the event location)
+- label: string | null (extracted from "#label" syntax)
+- timezone: string (must be exactly "${timeZone}")
+- recurrence: object | null (if recurring, format: { "rrule": "FREQ=WEEKLY;BYDAY=TU" })
 
 Rules:
 
 1. Date and time:
-  - Interpret relative expressions like "tomorrow", "next Monday", "明日", "来週".
-  - If duration is specified (e.g. "45分", "45 minutes"), calculate end time.
-  - If no duration is specified, default to 60 minutes.
+  - Interpret relative expressions like "tomorrow", "next Monday", "明日", "来週"
+  - Calculate dates relative to the provided current time
+  - Always use timezone: ${timeZone}
+  - Format datetime as ISO 8601 with timezone offset (e.g., "+09:00")
+  - If duration is specified (e.g., "45分", "45 minutes"), calculate end time accordingly
+  - If no duration is specified, default to 60 minutes
 
 2. Label:
-  - A word prefixed with "#" is always a label.
-  - Remove the label text from the title.
+  - A word prefixed with "#" is always a label
+  - Extract the label without the "#" prefix
+  - Remove the label text from the title
 
 3. Location:
-  - If a word or phrase is prefixed with "@", it is always the location.
-  - Otherwise, if a place name appears with particles or prepositions
-    such as:
-      - Japanese: "で", "にて", "場所は"
-      - English: "at", "in", "from"
-    then treat that place name as the location.
-  - Typical place examples include cities, venues, offices, online platforms.
-  - Remove the location text from the title.
+  - If a word or phrase is prefixed with "@" or "＠", it is always the location
+  - Otherwise, if a place name appears with particles or prepositions such as:
+    - Japanese: "で", "にて", "場所は"
+    - English: "at", "in", "from"
+    then treat that place name as the location
+  - Remove the location text from the title
 
 4. Title:
-  - The title should be what remains after removing date/time,
-    duration, label, and location.
-  - The title must be concise and human-readable.
+  - The title should be what remains after removing date/time, duration, label, and location
+  - The title must be concise and human-readable
 
 5. Output:
-  - Return only valid JSON.
-  - Do not include explanations or comments.
-  - Use null if a field is not present.
-
-Example:
-
-Input:
-"明日14時に東京で45分の登壇 #CodeRabbit"
-
-Output:
-{
-  "title": "登壇",
-  "start": "YYYY-MM-DDT14:00:00",
-  "end": "YYYY-MM-DDT14:45:00",
-  "location": "東京",
-  "label": "CodeRabbit",
-  "recurrence": null
+  - Return ONLY valid JSON
+  - Use null if a field is not present
+  - Do not include explanations or comments`;
 }
-`;
+
+function buildUserPrompt_(text: string, nowIso: string): string {
+  return `Current time: ${nowIso}
+
+Event description:
+${text}
+
+Extract the event information and return as JSON.`;
+}
+
+function buildTaskSystemPrompt_(timeZone: string): string {
+  return `You are a task management assistant that converts free-form natural language task descriptions into structured Google Tasks data.
+
+The input may be written in any language. Japanese and English must be supported.
+
+Your task is to extract the following fields and return them as a JSON object:
+
+- title: string (the task title)
+- due: string | null (due date in YYYY-MM-DD format, or null if no date specified)
+- notes: string | null (additional notes including recurrence information)
+- recurrence: string | null (human-readable recurrence description like "毎週火曜日" or "Every Tuesday")
+- taskList: string | null (task list name extracted from "#label" syntax)
+
+Rules:
+
+1. Date handling:
+  - Interpret relative expressions like "today", "tomorrow", "明日", "今日"
+  - Calculate dates relative to the provided current time
+  - Always use timezone: ${timeZone}
+  - Format date as YYYY-MM-DD (date only, no time)
+  - If no date is specified, use today's date
+  - If time is specified, ignore it (tasks are all-day by default)
+
+2. Recurrence:
+  - Extract recurrence patterns like "毎週火曜日", "Every Tuesday", "毎日", etc.
+  - Store the recurrence description in both the 'recurrence' field and 'notes' field
+  - Note: Google Tasks API does not natively support recurring tasks, so this is informational only
+
+3. Task List:
+  - A word prefixed with "#" is always a task list name
+  - Extract the task list name without the "#" prefix
+  - Remove the task list text from the title
+  - If no "#label" is provided, set taskList to null (will use default list)
+
+4. Title:
+  - Remove the leading "!" character from the title
+  - The title should be concise and clear
+  - Remove date/time expressions, recurrence patterns, and task list names from the title
+
+5. Output:
+  - Return ONLY valid JSON
+  - Use null if a field is not present
+  - Do not include explanations or comments`;
+}
+
+function buildTaskUserPrompt_(text: string, nowIso: string): string {
+  return `Current time: ${nowIso}
+
+Task description (starts with "!"):
+${text}
+
+Extract the task information and return as JSON.`;
 }
 
 // ===== Tests (run from Apps Script editor) =====
